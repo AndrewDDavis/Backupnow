@@ -1,0 +1,390 @@
+#!/bin/bash
+
+function printUsage {
+cat << EOF
+
+   $(basename $0)
+   ---------
+   Script runs an rsync backup to a remote server
+   Requires configuration in ~/.backupnow or /usr/local/etc/backupnow
+
+   Usage: $(basename $0) [options]
+
+   Options:
+    -a : archive deleted files in date-coded directory (implies -d)
+    -d : delete files from backup that are no longer present locally
+    -t : test-run; do not copy files
+
+EOF
+}
+
+# Robust scripting options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+[[ -f $HOME/.bash_script_messages ]] \
+   && source $HOME/.bash_script_messages \
+   || { echo "Error: $(basename $0) needs .bash_script_messages to run"; exit 6; }
+
+# Defaults
+testStr=''
+delStr=''
+archFlag=0
+mountedFlag=0
+maxDiskUsage=95
+archAge=365
+
+# Settings
+if [[ $( id -u ) == 0 ]]
+then
+   # root user
+   scriptEcho "Reading config: /usr/local/etc/backupnow/backupnow.conf"
+   source /usr/local/etc/backupnow/backupnow.conf
+   backExclude="/usr/local/etc/backupnow/backup_exclude.conf"
+   logFile="/var/log/backupnow.log"
+   lockFile="/tmp/backupnow.lock"
+
+else
+   scriptEcho "Reading config: ${HOME}/.backupnow/backupnow.conf"
+   source "${HOME}/.backupnow/backupnow.conf"
+   backExclude="${HOME}/.backupnow/backup_exclude.conf"
+   logFile="${HOME}/.backupnow/backupnow.log"
+   lockFile="/tmp/backupnow.lock"
+fi
+tmpFile=$(mktemp /tmp/$(basename -- $0).pid$$-XXXX)
+
+# Parse arguments
+while getopts "adth" flag
+do
+   case $flag in
+      a) archFlag=1; delStr="--delete --delete-excluded";;
+      d) delStr="--delete --delete-excluded";;
+      t) testStr="--dry-run";;
+      h) printUsage; exit 0;;
+      ?) printUsage; exit 2;;
+   esac
+done
+shift $((OPTIND-1))      # remove flags now that they're dealt with
+
+# Sanity check
+[[ -z "${backSource[*]}" ]] \
+   && { scriptEcho -l -e "No files specified to back up"; exit 1; }
+
+# Check for rsync executable
+[[ ! -x $locRsync ]] \
+   && { scriptEcho -l -e "local rsync executable not found: $locRsync"; exit 1; }
+
+# Define functions based on available tools
+function sedInPlace {
+
+   if [[ $argsVer == Darwin ]]
+   then
+      [[ -x /usr/bin/sed ]] \
+         && { /usr/bin/sed -i '' "$1" "$2" && return 0; } \
+         || { scriptEcho -l -e "/usr/bin/sed not found"; exit 2; }
+   elif [[ $argsVer == Gnu ]]
+   then
+      [[ -x /bin/sed ]] \
+         && { /bin/sed -i'' "$1" "$2" && return 0; } \
+         || { scriptEcho -l -e "/bin/sed not found"; exit 2; }
+   fi
+}
+
+function dateToSecs {
+
+   if [[ $argsVer == Darwin ]]
+   then
+      [[ -x /bin/date ]] \
+         && { /bin/date -jf "%Y-%m-%d %H:%M:%S" "$1" "+%s" && return 0; } \
+         || { scriptEcho -l -e "/bin/date not found"; exit 2; }
+   elif [[ $argsVer == Gnu ]]
+   then
+      [[ -x /bin/date ]] \
+         && { /bin/date --date="$1" "+%s" && return 0; } \
+         || { scriptEcho -l -e "/bin/date not found"; exit 2; }
+   fi
+}
+
+function octalFromStat {
+
+   if [[ $argsVer == Darwin ]]
+   then
+      [[ -x /usr/bin/stat ]] \
+         && { /usr/bin/stat -x "$1" | /usr/bin/grep Mode | /usr/bin/sed 's/  Mode: (\([0-9]\{1,\}\)\/.*/\1/' && return 0; } \
+         || { scriptEcho -l -e "/usr/bin/stat not found"; exit 2; }
+   elif [[ $argsVer == Gnu ]]
+   then
+      [[ -x /usr/bin/stat ]] \
+         && { /usr/bin/stat -c %a "$1" && return 0; } \
+         || { scriptEcho -l -e "/usr/bin/stat not found"; exit 2; }
+   fi
+}
+
+
+# Check if backupnow is already running and create lockFile
+if ( set -o noclobber; echo "$$" > "$lockFile" ) 2> /dev/null
+then
+   for sig in INT TERM EXIT
+   do
+      # remove lock file if script is cancelled or interrupted
+      trap "
+         echo \"$(basename $0) caught signal $sig\"
+         rm -f \"$lockFile\"
+         ((mountedFlag)) && backupprep -d
+         [[ $sig == EXIT ]] || kill -$sig $$
+      " $sig
+   done
+   
+   # Check if rsync already running
+   if [[ $(ps | grep -v grep | grep rsync | wc -l) -ne 0 ]]
+   then
+      scriptEcho -l -e "rsync appears to be running already"
+      exit 3
+   fi
+else
+   scriptEcho -l -e "Failed to acquire lockFile: $lockFile" 
+   scriptEcho -l "Lockfile held by $(cat $lockFile):"
+   scriptEcho -l "$(ps -e | grep -v grep | grep ^$(cat $lockFile))"
+   exit 3
+fi 
+
+# Check if rmtServer is actually local
+if [[ "$rmtServer" = "localhost" ]] \
+   || [[ "$rmtServer" = "127.0.0.1" ]] \
+   || [[ -z "$rmtServer" ]]
+then
+   rmtHost=""
+   rmtRsyncStr=""
+else
+   rmtHost="${rmtUser}@${rmtServer}:"
+   rmtRsyncStr="--rsync-path=${rmtRsync}"
+   
+   # Check if backup server is available
+   ping -c 1 -t 3 ${rmtServer} 1> /dev/null 2>&1 \
+      || { scriptEcho -l -e "ping of ${rmtServer} was not returned (error $?)"; exit 4; }
+fi
+
+# Clean log file
+[[ ! -e $logFile ]] && touch $logFile
+[[ -w $logFile ]] \
+   || { scriptEcho -l -e "no write permission on log file '$logFile'"; exit 5; }
+lfperms=$(octalFromStat "$logFile")                                     # current octal permissions of log file
+sedInPlace "/^Backup of [[:alnum:]_-]\{1,\} started at/! D" $logFile    # delete lines not matching
+tail -n 25 $logFile > $tmpFile                                          # keep only most recent 25 lines
+mv $tmpFile $logFile
+chmod $lfperms $logFile
+
+# Check whether backTarget exists, create if necessary
+function chkTarget {
+
+   if [[ -z "$rmtHost" ]]
+   then
+      # Mount if rmtTargDir is missing, otherwise make directory
+      [[ ! -d "${rmtBaseDir[$backCount]}" ]] && { backupprep; mountedFlag=1; }
+      [[ ! -d "${rmtBaseDir[$backCount]}" ]] \
+         && { scriptEcho -e -l -f "$logFile" "rmtBaseDir not found: ${rmtBaseDir[$backCount]}"; exit 5; }
+      [[ ! -d "${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}" ]] \
+         && mkdir -p "${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}"
+      
+      # Check disk space
+      usedPercent=$(df "${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}" | tail -1 | awk '{print $5}' | tr -d '%')
+      scriptEcho -l -f "$logFile" "Backup drive is ${usedPercent}% full"
+      if ((usedPercent>maxDiskUsage))
+      then
+         scriptEcho -l -e -f "$logFile" "Disk usage exceeds ${maxDiskUsage}%"
+         exit 6
+      fi
+   else
+      sshExit=0
+      ssh ${rmtUser}@${rmtServer} \
+        "[[ ! -d \"${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}\" ]] \
+           && echo \"ssh@\$(hostname): Creating directory: ${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}\" \
+           && mkdir -p \"${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}\"; \
+         usedPercent=\$(df \"${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}\" | tail -1 | awk '{print \$5}' | tr -d '%'); \
+         echo \"ssh@\$(hostname): Backup drive is \${usedPercent}% full\"; \
+         [[ \$usedPercent -gt $maxDiskUsage ]] && exit 6 || exit 0" | scriptEcho -l -f "$logFile" "-" || sshExit=$?
+      if ((sshExit==6))
+      then
+         scriptEcho -l -e -f "$logFile" "Disk usage exceeds ${maxDiskUsage}%"
+         exit 6
+      elif ((sshExit!=0))
+      then
+         scriptEcho -l -e -f "$logFile" "$FUNCNAME: ssh did not exit cleanly (error $sshExit)"
+         exit 7
+      fi
+   fi
+}
+
+# Manage archived files
+function manageArchs {
+
+   findOpts=( -maxdepth 1 -mindepth 1 -type d -name "archive-*" -mtime "+$archAge" )    # necessary to put in an array to get around sub-quote hell
+
+   if [[ -z "$rmtHost" ]]
+   then
+      # Make sure archives directory exists
+      [[ ! -d "${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}" ]] \
+         && scriptEcho -l -w -f "$logFile" "Creating directory: ${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}" \
+         && mkdir -p "${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}"
+      [[ ! -d "${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}" ]] &&\
+         { scriptEcho -l -e -f "$logFile" "archive directory could not be created" && exit 8; }
+
+      # Delete old archives (in a subshell so we return)
+      ( 
+         cd "${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}"
+         if [[ $(find . "${findOpts[@]}" | wc -l) -gt 0 ]]
+         then
+            scriptEcho -l -f "$logFile" "Deleting the following archives which are older than $archAge days:"
+            find . "${findOpts[@]}" 2>&1 | scriptEcho -l -f "$logFile" "-"
+            [[ $(uname -s) == Darwin ]] && find . "${findOpts[@]}" -exec /bin/chmod -R -N '{}' \+                 # strip ACLs on Mac servers to allow deletion
+            find . "${findOpts[@]}" -exec /bin/rm -r '{}' ';'
+         fi 
+      )
+   else
+      sshExit=0
+      ssh ${rmtUser}@${rmtServer} \
+        "findOpts=( -maxdepth 1 -mindepth 1 -type d -name \"archive-*\" -mtime +$archAge );
+         [[ ! -d \"${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}\" ]] \
+            && echo \"ssh@\$(hostname): Creating directory: ${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}\" \
+            && mkdir -p \"${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}\";
+         [[ ! -d \"${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}\" ]] && exit 8;
+         cd \"${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}\";
+         if [[ \$(find . \"\${findOpts[@]}\" | wc -l) -gt 0 ]]; then
+            echo \"ssh@\$(hostname): Deleting the following archives from \$(pwd) which are older than $archAge days:\";
+            find . \"\${findOpts[@]}\";
+            [[ \$(uname -s) == Darwin ]] && find . \"\${findOpts[@]}\" -exec /bin/chmod -R -N '{}' \+; 
+            find . \"\${findOpts[@]}\" -exec /bin/rm -r '{}' ';';
+         fi;" 2>&1 | scriptEcho -l -f "$logFile" "-" || sshExit=$?
+      if ((sshExit==8))
+      then
+         scriptEcho -l -e -f "$logFile" "archive directory could not be created"
+         exit 8
+      elif ((sshExit!=0))
+      then
+         scriptEcho -l -e -f "$logFile" "$FUNCNAME: ssh did not exit cleanly (error $sshExit)"
+         exit 9
+      fi 
+   fi
+}
+
+# Functions calls rsync and checks for errors
+function runRsync {
+
+   scriptEcho -l -f "$logFile" "Backing up ${backSource[$backCount]}..."
+   # Selected rsync args:
+   #  -a, --archive           archive mode; equals -rlptgoD (no -H,-A,-X)
+   #  -A, --acls              preserve ACLs (implies -p)
+   #  -b, --backup            make backups (see --suffix & --backup-dir)
+   #  -D                      same as --devices --specials
+   #  -e, --rsh=COMMAND       specify the remote shell to use
+   #  -g, --group             preserve group
+   #  -h, --human-readable    output numbers in a human-readable format
+   #  -H, --hard-links        preserve hard links
+   #  -l, --links             copy symlinks as symlinks
+   #  -n, --dry-run           perform a trial run with no changes made
+   #  -N, --crtimes           preserve create times (newness)
+   #  -o, --owner             preserve owner (super-user only)
+   #  -p, --perms             preserve permissions
+   #  -r, --recursive         recurse into directories
+   #  -s, --protect-args      no space-splitting; wildcard chars only (args protected from shell interpretation)
+   #  -t, --times             preserve modification times
+   #  -u, --update            skip files that are newer on the receiver
+   #  -v, --verbose           increase verbosity
+   #  -X, --xattrs            preserve extended attributes
+   #  -x, --one-file-system   don't cross filesystem boundaries
+   #  -z, --compress          compress file data during the transfer
+   #  --backup-dir=DIR        make backups into hierarchy based in DIR
+   #  --delete                delete extraneous files from dest dirs
+   #  --delete-excluded       also delete excluded files from dest dirs
+   #  --devices               preserve device files (super-user only)
+   #  --exclude-from=FILE     read exclude patterns from FILE
+   #  --fileflags             update file-flags to be same as source files and directories
+   #  --force-change          affect user/system immutable files/dirs
+   #  --hfs-compression       preserve HFS compression (if source & destination support it)
+   #  --protect-decmpfs       preserve HFS compression (regardless of volume support) (implies --fileflags and --xattrs)
+   #  --rsync-path=PROGRAM    specify the rsync to run on remote machine
+   #  --skip-compress=LIST    skip compressing files with suffix in LIST
+   #  --specials              preserve special files
+   #
+   # bombich uses -aNHAXx --fileflags --protect-decmpfs --force-change
+   
+   # using a looser set of options to prevent errors due to -X and -A
+   [[ $argsVer = Darwin ]] && rsOpts="-N --fileflags --force-change" || rsOpts=""
+   rsOpts="$rsOpts -hv -aHsx $testStr $delStr $archStr $rmtRsyncStr $exclStr"
+   $locRsync $rsOpts "${backSource[$backCount]}" "$backTarget" >> $logFile 2>&1 \
+      || { scriptEcho -l -e "rsync exited with error code $?, please check $logFile"; rsEmail; }
+   unset rsOpts
+}
+
+# Notify of RSync error, using mutt emailer (with msmtp back-end on Mac OS X, or ssmtp on Ubuntu)
+function rsEmail {
+
+   if [[ $adminEmail ]] && [[ $(which mutt) ]]
+   then
+      $locRsync --version > /tmp/rsyncVer.txt
+      scriptEcho -l -f "$logFile" "Sending email to administrator ($adminEmail) using $(which mutt)..."
+      echo -e "An error was encountered while executing the following command:\n\
+      $locRsync $rsOpts \"${backSource[$backCount]}\" \"$backTarget\" >> $logFile 2>&1\n\n\
+      Machine name: ${locMach}\n\
+      rsync version: $(cat /tmp/rsyncVer.txt)\n\n\
+      The log file is attached.\n" |\
+      mutt -s "Backupnow encountered an error on ${locMach}" -a "$logFile" -- $adminEmail ||\
+         scriptEcho -l -w -f "$logFile" "failed to send email with mutt"
+   else
+      scriptEcho -l -w -f "$logFile" "no email sent (adminEmail=$adminEmail, mutt=$(which mutt))"
+   fi
+}
+
+# Start the clock
+startDate=$(date "+%Y-%m-%d %H:%M:%S")
+startDates=$(dateToSecs "$startDate")                       # Start date in seconds
+startDateStr=$(printf "$startDate" | tr " :" "_.")          # Filename friendly format
+echo "----------------------------------------" >> $logFile
+scriptEcho -l -f "$logFile" "Backup of $locMach started at $startDate..."
+
+# Backup the requested directories
+scriptEcho -l -f "$logFile" "Directories to back up: ${#backSource[*]}"
+
+backCount=1
+while [[ $backCount -le ${#backSource[*]} ]]
+do
+   # Set up options for target directory and archiving
+   chkTarget
+   backTarget="${rmtHost}${rmtBaseDir[$backCount]}/${rmtTargDir[$backCount]#/}"
+
+   if ((archFlag)) && [[ ! -z "${rmtArchDir[$backCount]}" ]]
+   then                    # Archive deleted files
+      archStr="-b --backup-dir=${rmtBaseDir[$backCount]}/${rmtArchDir[$backCount]}/archive-${startDateStr}/${rmtTargDir[$backCount]#/}"
+      manageArchs
+   else
+      archStr=""
+   fi
+   [[ -n "$backExclude" ]] \
+      && exclStr="--exclude-from=$backExclude" \
+      || exclStr=""
+   
+   # check syntax
+   [[ "${backSource[$backCount]:(-1)}" != "/" ]] \
+      && scriptEcho -l -w -f "$logFile" "${backSource[$backCount]} has no trailing slash, exclude paths might be wrong"
+   
+   # start the backup run
+   [[ -d "${backSource[$backCount]}" ]] \
+      && runRsync \
+      || scriptEcho -l -w -f "$logFile" "backSource[$backCount] not found: ${backSource[$backCount]}"
+   
+   printf "\n\n" | tee -a $logFile
+   ((backCount++))
+done
+
+# Stop the clock
+endDate=$(date "+%Y-%m-%d %H:%M:%S")
+endDates=$(dateToSecs "$endDate")
+elaps=$((endDates-startDates))
+elapStr="$((elaps/60)) m $((elaps%60)) s"
+scriptEcho -l -f "$logFile" "Backup completed at ${endDate} (${elapStr} elapsed)"
+
+# clean up
+((mountedFlag)) && backupprep -d       # unmount if we mounted the drive
+/bin/rm -f "$lockFile"
+trap - INT TERM EXIT

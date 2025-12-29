@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Make a list of installed packages for later reinstallation
+# Source: http://www.webupd8.org/2010/03/2-ways-of-reinstalling-all-of-your.html
+#
+# To restore the list, use:
+#  sudo dpkg --set-selections < installed-applications.txt
+#  sudo apt-get -y update
+#  sudo apt-get dselect-upgrade
+
+# check backup location existence
+bakdir="$HOME/.backupnow/baklist"
+if [ ! -d "$bakdir" ]; then
+   echo "baklist directory not found"
+   exit 1
+fi
+
+# dpkg generates the list
+sudo dpkg --get-selections > "$bakdir"/installed-applications.txt
+
+# Back up PPAs as well
+rsync -a --delete /etc/apt/sources.list /etc/apt/sources.list.d "$bakdir"/PPAs
+
+# manually installed packages
+apt-mark showmanual > "$bakdir"/manual-packages.txt

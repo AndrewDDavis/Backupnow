@@ -1,0 +1,117 @@
+#!/bin/bash
+
+#----------------------------------------------------------------------------------------------#
+# This script mounts the network share and disk image for backupnow
+#
+# v0.9.0 -- Apr 2011 |--| Andrew Davis -- addavis@gmail.com
+#----------------------------------------------------------------------------------------------#
+
+printUsage () {
+cat << EOF
+
+   $(basename $0)
+   ----------
+   Script mounts the network share and disk image for backupnow
+
+   Usage: $(basename $0) [options]
+
+   Options:
+    -d : detach backup drive and sparse image if mounted
+
+EOF
+}
+
+# Robust options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+if [[ -f $HOME/.bash_script_messages ]]
+then
+   # scriptError, etc
+   source $HOME/.bash_script_messages
+else
+   alias scriptEcho='echo' && alias scriptWarn='echo' && alias scriptErr='echo' && alias scriptMsg='echo' && alias scriptMsgr='echo' && alias scriptEmph='echo' && alias scriptDebug='echo'
+fi
+
+# Defaults
+rmtServer="nemo"
+rmtUser="hud"
+rmtPass="HTPCadmin07"
+afpShare="schleck-Backup"
+imageFile="/Volumes/${afpShare}/merckx/merckx-image.sparseimage"
+imageVolName="merckx-image"
+detachFlag=0
+
+# Parse arguments
+while getopts "adth" flag
+do
+   case $flag in
+      d) detachFlag=1;;
+      h) printUsage; exit 0;;
+      ?) printUsage; exit 2;;
+   esac
+done
+shift $((OPTIND-1))      # remove flags now that they're dealt with
+
+# Catch exceptions
+for sig in INT TERM EXIT
+do
+   trap "
+      echo \"$(basename $0) caught signal $sig\"
+      [[ $sig == EXIT ]] || kill -$sig $$
+   " $sig
+done
+
+# Detach drives if requested
+if ((detachFlag))
+then
+   if [[ -d "/Volumes/$imageVolName" ]]
+   then
+      scriptEcho -l "Unmounting image and AFP volume..."
+      hdiutil detach "/Volumes/$imageVolName" -quiet
+      umount /Volumes/${afpShare}
+   elif [[ -d /Volumes/${afpShare} ]]
+   then
+      scriptEcho -l "Unmounting AFP volume..."
+      umount /Volumes/${afpShare}
+   else
+      scriptEcho -l -w "Volumes not found: /Volumes/$imageVolName, /Volumes/${afpShare}"
+      scriptEcho -l -w "Nothing done"
+   fi
+   trap - INT TERM EXIT && exit 0
+fi
+
+# Check if drive is already mounted
+if [[ -d "/Volumes/$imageVolName" ]]
+then
+   scriptEcho -l -w "Volume already mounted: $imageVolName"
+   scriptEcho -l -w "Nothing done"
+   exit 1
+fi
+
+# Check if backup server is available
+/sbin/ping -ot 3 ${rmtServer} 1> /dev/null 2>&1 ||\
+   { scriptEcho -l -e "ping of ${rmtServer} was not returned" && exit 2; }
+
+# Mount the AFP share from remote server
+if [[ ! -d /Volumes/${afpShare} ]]
+then
+   scriptEcho -l "Mounting AFP volume..."
+   mkdir /Volumes/${afpShare}
+   mount -w -o nobrowse -t afp afp://${rmtUser}:${rmtPass}@${rmtServer}/${afpShare} /Volumes/${afpShare}
+else
+   scriptEcho -l -w "/Volumes/${afpShare}: mount point exists"
+fi
+
+# Mount the sparse image
+if [[ -f "$imageFile" ]]
+then
+   scriptEcho -l "Attaching image..."
+   hdiutil attach "$imageFile" -quiet -nobrowse
+else
+   scriptEcho -l -e "Image file not found: $imageFile"
+   exit 3
+fi
+
+trap - INT TERM EXIT
