@@ -1,5 +1,7 @@
 # Backupnow
 
+**NOTICE:** this script is no longer under development. To make really robust and efficient backups, I recommend using the [borg-go](https://github.com/AndrewDDavis/borg_go) scripts instead.
+
 The `backupnow` script runs `rsync` to create a backup on a remote machine.
 
 - This requires local and remote rsync binaries (Fink's is great, Ubuntu repos fine for local backups). For compiling, refer to [bombich](http://www.bombich.com/mactips/rsync.html).
